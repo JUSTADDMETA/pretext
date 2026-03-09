@@ -1,0 +1,239 @@
+import { writeFileSync } from 'node:fs'
+import { type ChildProcess } from 'node:child_process'
+import {
+  createBrowserSession,
+  ensurePageServer,
+  loadHashReport,
+  type BrowserKind,
+} from './browser-automation.ts'
+
+type CorpusMeta = {
+  id: string
+  language: string
+  title: string
+  min_width?: number
+  max_width?: number
+}
+
+type CorpusReport = {
+  status: 'ready' | 'error'
+  requestId?: string
+  corpusId?: string
+  title?: string
+  width?: number
+  predictedHeight?: number
+  actualHeight?: number
+  diffPx?: number
+  predictedLineCount?: number
+  browserLineCount?: number
+  message?: string
+}
+
+type SweepMismatch = {
+  width: number
+  diffPx: number
+  predictedHeight: number
+  actualHeight: number
+  predictedLineCount: number | null
+  browserLineCount: number | null
+}
+
+type SweepSummary = {
+  corpusId: string
+  language: string
+  title: string
+  browser: BrowserKind
+  start: number
+  end: number
+  step: number
+  widthCount: number
+  exactCount: number
+  mismatches: SweepMismatch[]
+}
+
+type SweepOptions = {
+  id: string | null
+  all: boolean
+  start: number
+  end: number
+  step: number
+  port: number
+  browser: BrowserKind
+  output: string | null
+}
+
+function parseStringFlag(name: string): string | null {
+  const prefix = `--${name}=`
+  const arg = process.argv.find(value => value.startsWith(prefix))
+  return arg === undefined ? null : arg.slice(prefix.length)
+}
+
+function parseNumberFlag(name: string, fallback: number): number {
+  const raw = parseStringFlag(name)
+  if (raw === null) return fallback
+  const parsed = Number.parseInt(raw, 10)
+  if (!Number.isFinite(parsed)) {
+    throw new Error(`Invalid value for --${name}: ${raw}`)
+  }
+  return parsed
+}
+
+function hasFlag(name: string): boolean {
+  return process.argv.includes(`--${name}`)
+}
+
+function parseBrowser(value: string | null): BrowserKind {
+  const browser = (value ?? process.env['CORPUS_CHECK_BROWSER'] ?? 'chrome').toLowerCase()
+  if (browser !== 'chrome' && browser !== 'safari') {
+    throw new Error(`Unsupported browser ${browser}; expected chrome or safari`)
+  }
+  return browser
+}
+
+async function loadSources(): Promise<CorpusMeta[]> {
+  return await Bun.file('corpora/sources.json').json()
+}
+
+function parseOptions(): SweepOptions {
+  const start = parseNumberFlag('start', 300)
+  const end = parseNumberFlag('end', 900)
+  const step = parseNumberFlag('step', 10)
+  if (step <= 0) throw new Error('--step must be > 0')
+  if (end < start) throw new Error('--end must be >= --start')
+
+  return {
+    id: parseStringFlag('id'),
+    all: hasFlag('all'),
+    start,
+    end,
+    step,
+    port: parseNumberFlag('port', Number.parseInt(process.env['CORPUS_CHECK_PORT'] ?? '3210', 10)),
+    browser: parseBrowser(parseStringFlag('browser')),
+    output: parseStringFlag('output'),
+  }
+}
+
+function getSweepWidths(meta: CorpusMeta, options: SweepOptions): number[] {
+  const min = Math.max(options.start, meta.min_width ?? options.start)
+  const max = Math.min(options.end, meta.max_width ?? options.end)
+  const widths: number[] = []
+  for (let width = min; width <= max; width += options.step) {
+    widths.push(width)
+  }
+  return widths
+}
+
+function bucketMismatches(mismatches: SweepMismatch[]): string {
+  if (mismatches.length === 0) return 'exact'
+
+  const buckets = new Map<number, number[]>()
+  for (const mismatch of mismatches) {
+    const list = buckets.get(mismatch.diffPx)
+    if (list === undefined) {
+      buckets.set(mismatch.diffPx, [mismatch.width])
+    } else {
+      list.push(mismatch.width)
+    }
+  }
+
+  return [...buckets.entries()]
+    .sort((a, b) => a[0] - b[0])
+    .map(([diffPx, widths]) => `${diffPx > 0 ? '+' : ''}${diffPx}px: ${widths.join(', ')}`)
+    .join(' | ')
+}
+
+function printSummary(summary: SweepSummary): void {
+  console.log(
+    `${summary.corpusId} (${summary.language}) | ${summary.exactCount}/${summary.widthCount} exact | ${summary.mismatches.length} nonzero`,
+  )
+  console.log(`  ${bucketMismatches(summary.mismatches)}`)
+}
+
+const options = parseOptions()
+const sources = await loadSources()
+
+const targets = options.all
+  ? sources
+  : (() => {
+      if (options.id === null) {
+        throw new Error(`Missing --id or --all. Available corpora: ${sources.map(source => source.id).join(', ')}`)
+      }
+      const meta = sources.find(source => source.id === options.id)
+      if (meta === undefined) {
+        throw new Error(`Unknown corpus ${options.id}. Available corpora: ${sources.map(source => source.id).join(', ')}`)
+      }
+      return [meta]
+    })()
+
+const session = createBrowserSession(options.browser)
+let serverProcess: ChildProcess | null = null
+const summaries: SweepSummary[] = []
+
+try {
+  const pageServer = await ensurePageServer(options.port, '/corpus', process.cwd())
+  serverProcess = pageServer.process
+  const baseUrl = `${pageServer.baseUrl}/corpus`
+
+  for (const meta of targets) {
+    const widths = getSweepWidths(meta, options)
+    const mismatches: SweepMismatch[] = []
+    let exactCount = 0
+
+    for (let i = 0; i < widths.length; i++) {
+      const width = widths[i]!
+      if (i > 0 && i % 50 === 0) {
+        console.log(`${meta.id}: progress ${i}/${widths.length}`)
+      }
+
+      const requestId = `${Date.now()}-${width}-${Math.random().toString(36).slice(2)}`
+      const url =
+        `${baseUrl}?id=${encodeURIComponent(meta.id)}` +
+        `&width=${width}` +
+        `&report=1` +
+        `&requestId=${encodeURIComponent(requestId)}`
+
+      const report = await loadHashReport<CorpusReport>(session, url, requestId, options.browser)
+      if (report.status === 'error') {
+        throw new Error(`Corpus page returned error for ${meta.id} @ ${width}: ${report.message ?? 'unknown error'}`)
+      }
+
+      const diffPx = Math.round(report.diffPx ?? 0)
+      if (diffPx === 0) {
+        exactCount++
+        continue
+      }
+
+      mismatches.push({
+        width,
+        diffPx,
+        predictedHeight: Math.round(report.predictedHeight ?? 0),
+        actualHeight: Math.round(report.actualHeight ?? 0),
+        predictedLineCount: report.predictedLineCount ?? null,
+        browserLineCount: report.browserLineCount ?? null,
+      })
+    }
+
+    const summary: SweepSummary = {
+      corpusId: meta.id,
+      language: meta.language,
+      title: meta.title,
+      browser: options.browser,
+      start: options.start,
+      end: options.end,
+      step: options.step,
+      widthCount: widths.length,
+      exactCount,
+      mismatches,
+    }
+    summaries.push(summary)
+    printSummary(summary)
+  }
+
+  if (options.output !== null) {
+    writeFileSync(options.output, JSON.stringify(summaries, null, 2))
+    console.log(`wrote ${options.output}`)
+  }
+} finally {
+  session.close()
+  serverProcess?.kill()
+}
